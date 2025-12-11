@@ -1,88 +1,63 @@
+# crew_runner.py
 from crewai import Crew
-from crew_tasks import router_task, support_task, student_task
-
-
-def extract_router_decision(text: str) -> str:
-    """
-    ✅ Extracts clean SUPPORT or STUDENT from messy router output
-    """
-    text = text.upper()
-
-    if "STUDENT" in text:
-        return "STUDENT"
-    if "SUPPORT" in text:
-        return "SUPPORT"
-
-    # ✅ Fallback safety
-    return "SUPPORT"
-
+from crew_tasks import router_task, student_task, support_task
 
 def extract_clean_answer(result):
-    """
-    ✅ Extract ONLY raw LLM answer (removes description, summary, etc.)
-    """
-
-    # Case 1: Modern CrewAI format
-    if hasattr(result, "tasks_output") and result.tasks_output:
-        output = result.tasks_output[0]
-        if hasattr(output, "raw_output"):
-            return output.raw_output.strip()
-
-    # Case 2: Older format
-    if hasattr(result, "raw_output"):
-        return result.raw_output.strip()
-
-    # Case 3: HARDCODED CLEANUP for your exact bug
-    text = str(result)
-
-    if 'raw_output="' in text:
-        return text.split('raw_output="')[-1].rsplit('"', 1)[0].strip()
-
-    return text.strip()
-
-
-def safe_kickoff(crew, user_input):
+    # Robust extraction of textual output
     try:
-        result = crew.kickoff(inputs={"user_query": user_input})
+        if hasattr(result, "tasks_output") and result.tasks_output:
+            out = result.tasks_output[0]
+            if hasattr(out, "raw_output") and out.raw_output:
+                return out.raw_output.strip()
+        if hasattr(result, "raw_output") and result.raw_output:
+            return result.raw_output.strip()
+    except Exception:
+        pass
+    return str(result).strip()
+
+def safe_kickoff(crew, query):
+    try:
+        result = crew.kickoff(inputs={"user_query": query})
         return extract_clean_answer(result)
-
-    # ✅ Windows CrewAI metrics crash bypass
-    except IndexError:
+    except Exception as e:
+        # log and fallback
+        print("[safe_kickoff] Exception:", e)
         try:
-            output = crew.tasks[0].output
-            return extract_clean_answer(output)
+            # old fallback: try task output
+            to = crew.tasks[0].output
+            return str(to).strip()
         except Exception:
-            return "Task completed successfully."
+            return "Task executed but no text output generated."
 
+def extract_router_decision(text: str) -> str:
+    if not text:
+        return "SUPPORT"
+    t = text.upper().strip()
+    if "STUDENT" in t:
+        return "STUDENT"
+    if "SUPPORT" in t:
+        return "SUPPORT"
+    # Try to parse if the router returned JSON-like or quoted value
+    if '"STUDENT"' in t or "'STUDENT'" in t:
+        return "STUDENT"
+    if '"SUPPORT"' in t or "'SUPPORT'" in t:
+        return "SUPPORT"
+    return "SUPPORT"
 
 def route_query(user_input: str):
-    # ✅ STEP 1: Ask ROUTER LLM
-    router_crew = Crew(
-        tasks=[router_task],
-        process="sequential",
-        verbose=False
-    )
+    # 1) Ask Router
+    router_crew = Crew(tasks=[router_task], process="sequential", verbose=False)
+    router_raw = safe_kickoff(router_crew, user_input)
+    decision = extract_router_decision(router_raw)
+    print(f"[Router Decision] → {decision}")
 
-    raw_router_output = safe_kickoff(router_crew, user_input)
-    route_decision = extract_router_decision(raw_router_output)
-
-    print(f"\n[LLM Router Decision] → {route_decision}")
-
-    # ✅ STEP 2: ROUTE CORRECTLY (THIS WAS YOUR BUG)
-    if route_decision == "STUDENT":
-        print("[Orchestrator] Routing to Student Agent...")
-        crew = Crew(
-            tasks=[student_task],
-            process="sequential",
-            verbose=True
-        )
+    # 2) Delegate
+    if decision == "STUDENT":
+        print("[Delegation] → Student Agent (RAG Tool)")
+        crew = Crew(tasks=[student_task], process="sequential", verbose=True)
     else:
-        print("[Orchestrator] Routing to Support Agent...")
-        crew = Crew(
-            tasks=[support_task],
-            process="sequential",
-            verbose=True
-        )
+        print("[Delegation] → Support Agent (Web Search Tool)")
+        crew = Crew(tasks=[support_task], process="sequential", verbose=True)
 
-    return safe_kickoff(crew, user_input)
-
+    answer = safe_kickoff(crew, user_input)
+    return answer or "No answer generated."
